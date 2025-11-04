@@ -1,0 +1,8 @@
+torch
+Pillow
+huggingface_hub
+transformers
+bitsandbytes
+fastapi
+uvicorn
+python-multipart
