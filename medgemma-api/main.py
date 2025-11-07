@@ -21,6 +21,15 @@ app = FastAPI()
 processor = None
 model = None
 
+# --- CORS Configuration ---
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # In production, specify exact origins like ["http://localhost:8080"]
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # --- Mount static files ---
 app.mount("/static", StaticFiles(directory="static", html=True), name="static")
 
