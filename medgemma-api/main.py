@@ -31,7 +31,14 @@ app.add_middleware(
 )
 
 # --- Mount static files ---
-app.mount("/static", StaticFiles(directory="static", html=True), name="static")
+# Serve the new React frontend from the built dist folder
+# Make sure to build the frontend first: cd ../medgemma-frontend && npm run build
+app.mount("/assets", StaticFiles(directory="../medgemma-frontend/dist/assets"), name="assets")
+
+# Serve favicon and other static files from dist root
+@app.get("/favicon.ico")
+async def favicon():
+    return FileResponse("../medgemma-frontend/dist/favicon.ico")
 
 class TextRequest(BaseModel):
     prompt: str
@@ -131,7 +138,7 @@ def extract_answer(response: str) -> str:
 
 @app.get("/")
 def read_root():
-    return FileResponse("static/index.html")
+    return FileResponse("../medgemma-frontend/dist/index.html")
 
 @app.post("/predict/text")
 async def predict_text(request: TextRequest):
@@ -170,4 +177,4 @@ async def predict_chained_image(prompt: str = Form(...), image: UploadFile = Fil
     }
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="140.112.30.56", port=8000)
+    uvicorn.run(app, host="localhost", port=8000)
