@@ -95,26 +95,77 @@ const Index = () => {
         body: formData,
       });
 
-      if (!res.ok) {
+      if (!res.ok || !res.body) {
         const errorText = await res.text();
         throw new Error(`HTTP error! status: ${res.status}, message: ${errorText}`);
       }
 
-      const result = await res.json();
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let vlmBuffer = "";
+      let llmBuffer = "";
 
-      if (result.error) {
-        throw new Error(result.error);
+      const refreshResponse = () => {
+        const formattedResponse = [
+          vlmBuffer ? `Vision Model Analysis:\n${vlmBuffer.trim()}` : null,
+          llmBuffer ? `${llmBuffer.trim()}` : null,
+        ]
+          .filter(Boolean)
+          .join("\n\n");
+
+        setResponse(formattedResponse);
+      };
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) {
+          break;
+        }
+
+        buffer += decoder.decode(value, { stream: true });
+
+        let boundary = buffer.search(/\r?\n\r?\n/);
+        while (boundary !== -1) {
+          const chunk = buffer.slice(0, boundary);
+          buffer = buffer.slice(boundary + (buffer[boundary] === "\r" ? 4 : 2));
+
+          const lines = chunk.split(/\r?\n/).map((line) => line.trim());
+          const dataLine = lines.find((line) => line.startsWith("data:"));
+
+          if (!dataLine || dataLine.startsWith(":")) {
+            boundary = buffer.search(/\r?\n\r?\n/);
+            continue;
+          }
+
+          try {
+            const payload = JSON.parse(dataLine.replace(/^data:\s*/, ""));
+            if (payload.event === "status" && payload.state === "queued") {
+              setResponse("Queued... awaiting GPU availability.");
+            } else if (payload.event === "status" && payload.state === "processing") {
+              setResponse("Processing...");
+            } else if (payload.event === "vlm_token" && payload.token) {
+              vlmBuffer += payload.token;
+              refreshResponse();
+            } else if (payload.event === "llm_token" && payload.token) {
+              llmBuffer += payload.token;
+              refreshResponse();
+            } else if (payload.event === "done") {
+              vlmBuffer = payload.vlm_output ?? vlmBuffer;
+              llmBuffer = payload.llm_report ?? llmBuffer;
+              refreshResponse();
+              toast.success("Response received successfully");
+            } else if (payload.event === "error") {
+              throw new Error(payload.message || "Stream error");
+            }
+          } catch (err) {
+            console.error("Failed to parse stream chunk", err);
+            throw err;
+          }
+
+          boundary = buffer.search(/\r?\n\r?\n/);
+        }
       }
-
-      const formattedResponse = [
-        result.vlm_output ? `Vision Model Analysis:\n${result.vlm_output.trim()}` : null,
-        result.llm_report ? `${result.llm_report.trim()}` : null,
-      ]
-        .filter(Boolean)
-        .join("\n\n");
-
-      setResponse(formattedResponse || JSON.stringify(result, null, 2));
-      toast.success("Response received successfully");
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : "An unknown error occurred";
       setResponse(`Error: ${errorMessage}`);

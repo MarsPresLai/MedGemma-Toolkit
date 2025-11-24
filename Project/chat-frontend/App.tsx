@@ -3,20 +3,8 @@ import { SendHorizontal, Menu, AlertCircle, Paperclip, X } from 'lucide-react';
 
 import Sidebar from './components/Sidebar';
 import ChatBubble from './components/ChatBubble';
-import TypingIndicator from './components/TypingIndicator';
 import { Message, Role, Attachment, ChatSession } from './types';
-import { analyzeCase } from './services/api';
-
-const formatModelResponse = (vlmOutput: string, llmReport: string) => {
-  const findings = vlmOutput.trim();
-  const report = llmReport.trim();
-
-  if (!findings) {
-    return report;
-  }
-
-  return `### Vision Findings\n${findings}\n\n${report}`;
-};
+import { analyzeCaseStream } from './services/api';
 
 const convertFileToDataUrl = (file: File): Promise<string> => {
   return new Promise((resolve, reject) => {
@@ -160,15 +148,23 @@ const App: React.FC = () => {
       textareaRef.current.style.height = 'auto';
     }
 
+    const now = Date.now();
     const newUserMsg: Message = {
-      id: Date.now().toString(),
+      id: now.toString(),
       role: Role.USER,
       content: userText,
-      timestamp: Date.now(),
+      timestamp: now,
       attachment: attachmentForMessage,
     };
+    const modelMsgId = `${now}-model`;
+    const modelMsg: Message = {
+      id: modelMsgId,
+      role: Role.MODEL,
+      content: '',
+      timestamp: Date.now(),
+    };
 
-    setMessages((prev) => [...prev, newUserMsg]);
+    setMessages((prev) => [...prev, newUserMsg, modelMsg]);
     setIsLoading(true);
     setError(null);
 
@@ -186,22 +182,53 @@ const App: React.FC = () => {
       setCurrentSessionId(newSessionId);
     }
 
-    try {
-      const response = await analyzeCase(userText, imageFile);
-      const formatted = formatModelResponse(response.vlm_output, response.llm_report);
+    let vlmBuffer = '';
+    let llmBuffer = '';
 
-      const modelMsg: Message = {
-        id: (Date.now() + 1).toString(),
-        role: Role.MODEL,
-        content: formatted,
-        timestamp: Date.now(),
-      };
-      setMessages((prev) => [...prev, modelMsg]);
+    const updateModelContent = (content: string) => {
+      setMessages((prev) =>
+        prev.map((msg) => (msg.id === modelMsgId ? { ...msg, content } : msg)),
+      );
+    };
+
+    const refreshModelContent = () => {
+      const formatted = llmBuffer.trim();
+      updateModelContent(formatted);
+    };
+
+    try {
+      await analyzeCaseStream(userText, imageFile, {
+        onStatus: (state) => {
+          if (state === 'queued') {
+            updateModelContent('Queued... awaiting GPU availability.');
+          } else if (state === 'processing') {
+            updateModelContent('Processing...');
+          }
+        },
+        onVlmToken: (token) => {
+          vlmBuffer += token;
+          refreshModelContent();
+        },
+        onLlmToken: (token) => {
+          llmBuffer += token;
+          refreshModelContent();
+        },
+        onDone: (payload) => {
+          vlmBuffer = payload.vlm_output ?? vlmBuffer;
+          llmBuffer = payload.llm_report ?? llmBuffer;
+          refreshModelContent();
+        },
+        onError: (message) => {
+          setError(message);
+          updateModelContent(`Error: ${message}`);
+        },
+      });
     } catch (err) {
       console.error('Analysis error:', err);
       const detail =
         err instanceof Error ? err.message : 'Failed to get response. Please try again.';
       setError(detail);
+      updateModelContent(`Error: ${detail}`);
     } finally {
       setIsLoading(false);
     }
@@ -286,12 +313,6 @@ const App: React.FC = () => {
             {messages.map((msg) => (
               <ChatBubble key={msg.id} message={msg} />
             ))}
-
-            {isLoading && (
-              <div className="mb-6 flex justify-start w-full max-w-3xl">
-                <TypingIndicator text="Analyzing..." />
-              </div>
-            )}
 
             {error && (
               <div className="mx-auto my-4 p-3 bg-red-50 text-red-600 text-sm rounded-lg flex items-center gap-2 border border-red-100">

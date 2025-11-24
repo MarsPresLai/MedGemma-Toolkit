@@ -1,22 +1,23 @@
 from __future__ import annotations
 
 import base64
+import json
 import logging
 import re
-from typing import Any, Dict, Optional
+from typing import AsyncIterator, Dict, Optional
 
 import httpx
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import Field
 from pydantic_settings import BaseSettings
+from sse_starlette.sse import EventSourceResponse
 
 
 class Settings(BaseSettings):
     ollama_base_url: str = Field(default="http://ollama:11434")
     vlm_model: str = Field(default="hf.co/unsloth/medgemma-27b-it-GGUF:Q4_K_M")
-    llm_model: str = Field(default="hf.co/mradermacher/II-Medical-8B-GGUF:Q4_K_M")
+    llm_model: str = Field(default="llama3.1:latest")
     request_timeout_seconds: float = Field(default=180.0, gt=0)
 
 
@@ -35,45 +36,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-http_client = httpx.AsyncClient(timeout=httpx.Timeout(settings.request_timeout_seconds))
-
-
-class AnalyzeResponse(BaseModel):
-    vlm_output: str
-    llm_report: str
-
-
-async def _call_ollama_generate(
-    model: str,
-    prompt_text: str,
-    image_b64: Optional[str] = None,
-) -> str:
-    payload: Dict[str, Any] = {
-        "model": model,
-        "prompt": prompt_text,
-        "stream": False,
-        "options": {"temperature": 0},
-    }
-    if image_b64:
-        payload["images"] = [image_b64]
-
-    try:
-        response = await http_client.post(f"{settings.ollama_base_url}/api/generate", json=payload)
-        response.raise_for_status()
-    except httpx.HTTPError as exc:
-        logger.exception("Ollama generate request failed.")
-        detail = getattr(exc.response, "text", None) if hasattr(exc, "response") else None
-        raise HTTPException(
-            status_code=502,
-            detail=f"Ollama generate request failed: {exc}. Response: {detail}",
-        ) from exc
-
-    data = response.json()
-    result = data.get("response")
-    if not result:
-        raise HTTPException(status_code=500, detail="Ollama returned an empty response.")
-    return result.strip()
-
 
 def _build_vlm_prompt(prompt: str, has_image: bool) -> str:
     if has_image:
@@ -88,28 +50,6 @@ def _build_vlm_prompt(prompt: str, has_image: bool) -> str:
         f"User: {user_prompt}\n"
         "Assistant:"
     )
-
-
-async def run_vlm(prompt: str, image_b64: Optional[str]) -> str:
-    prompt_text = _build_vlm_prompt(prompt, bool(image_b64))
-    return await _call_ollama_generate(settings.vlm_model, prompt_text, image_b64)
-
-
-async def run_llm(prompt: str, vlm_output: str) -> str:
-    report_prompt = (
-        "Generate a structured medical report based on the following clinician prompt and vision findings.\n\n"
-        f"Clinician prompt: {prompt}\n\n"
-        f"Vision findings: {vlm_output}\n\n"
-        "The report must contain the following sections in order:\n"
-        "1. Summary\n"
-        "2. Supporting Evidence\n"
-        "3. Differential Diagnosis\n"
-        "4. Recommended Next Steps\n\n"
-        "Begin the report directly with the 'Summary' section. Do not include any introductory phrases or conversational text.\n"
-        "Explicitly state any uncertainties and base the report strictly on the provided vision findings.\n"
-    )
-    llm_output = await _call_ollama_generate(settings.llm_model, report_prompt)
-    return _extract_answer_only(llm_output)
 
 
 def _extract_answer_only(text: str) -> str:
@@ -144,9 +84,54 @@ def _extract_answer_only(text: str) -> str:
     return text.strip()
 
 
-@app.on_event("shutdown")
-async def shutdown_event() -> None:
-    await http_client.aclose()
+async def _ollama_token_stream(
+    model: str,
+    prompt_text: str,
+    image_b64: Optional[str] = None,
+) -> AsyncIterator[str]:
+    """
+    Streams tokens from Ollama's generate API.
+    """
+    payload: Dict[str, Any] = {
+        "model": model,
+        "prompt": prompt_text,
+        "stream": True,
+        "options": {"temperature": 0},
+    }
+    if image_b64:
+        payload["images"] = [image_b64]
+
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(settings.request_timeout_seconds)) as client:
+            async with client.stream("POST", f"{settings.ollama_base_url}/api/generate", json=payload) as response:
+                response.raise_for_status()
+                async for line in response.aiter_lines():
+                    if not line:
+                        continue
+                    data = json.loads(line)
+                    token = data.get("response")
+                    if token:
+                        yield token
+                    if data.get("done"):
+                        break
+    except httpx.HTTPError as exc:
+        logger.exception("Streaming generate request failed.")
+        raise RuntimeError(f"Ollama streaming request failed: {exc}") from exc
+
+
+def _build_report_prompt(prompt: str, vlm_output: str) -> str:
+    return (
+        "Generate a structured medical report based on the following clinician prompt and vision findings.\n\n"
+        f"Clinician prompt: {prompt}\n\n"
+        f"Vision findings: {vlm_output}\n\n"
+        "The report must contain the following sections in order:\n"
+        "1. Summary\n"
+        "2. Supporting Evidence\n"
+        "3. Differential Diagnosis\n"
+        "4. Recommended Next Steps\n\n"
+        "Begin the report directly with the 'Summary' section. Do not include any introductory phrases or conversational text.\n"
+        "Explicitly state any uncertainties and base the report strictly on the provided vision findings.\n"
+    )
 
 
 @app.get("/healthz")
@@ -154,11 +139,11 @@ async def healthcheck() -> Dict[str, str]:
     return {"status": "ok"}
 
 
-@app.post("/api/analyze/", response_model=AnalyzeResponse)
+@app.post("/api/analyze/")
 async def analyze_case(
     prompt: str = Form(..., min_length=0, max_length=2000),
     image: Optional[UploadFile] = File(default=None),
-) -> JSONResponse:
+) -> EventSourceResponse:
     image_b64: Optional[str] = None
 
     if image:
@@ -167,8 +152,28 @@ async def analyze_case(
             raise HTTPException(status_code=400, detail="Uploaded image is empty.")
         image_b64 = base64.b64encode(content).decode("utf-8")
 
-    vlm_result = await run_vlm(prompt, image_b64)
-    llm_report = await run_llm(prompt, vlm_result)
+    async def event_stream() -> AsyncIterator[str]:
+        vlm_buffer = ""
+        llm_buffer = ""
+        try:
+            yield json.dumps({"event": "status", "state": "processing"})
 
-    response = AnalyzeResponse(vlm_output=vlm_result, llm_report=llm_report)
-    return JSONResponse(content=response.model_dump())
+            vlm_prompt = _build_vlm_prompt(prompt, bool(image_b64))
+            async for token in _ollama_token_stream(settings.vlm_model, vlm_prompt, image_b64=image_b64):
+                vlm_buffer += token
+                yield json.dumps({"event": "vlm_token", "token": token})
+
+            yield json.dumps({"event": "vlm_complete", "vlm_output": vlm_buffer})
+
+            report_prompt = _build_report_prompt(prompt, vlm_buffer)
+            async for token in _ollama_token_stream(settings.llm_model, report_prompt):
+                llm_buffer += token
+                yield json.dumps({"event": "llm_token", "token": token})
+
+            llm_report = _extract_answer_only(llm_buffer)
+            yield json.dumps({"event": "done", "vlm_output": vlm_buffer, "llm_report": llm_report})
+        except Exception as exc:
+            logger.exception("Streaming pipeline failed.")
+            yield json.dumps({"event": "error", "message": str(exc)})
+
+    return EventSourceResponse(event_stream(), media_type="text/event-stream")
